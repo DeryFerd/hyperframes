@@ -8,15 +8,14 @@ import { CatalogDetail, CatalogSlot } from "/snippets/catalog-detail.jsx";
 import { InstallCommand } from "/snippets/install-command.jsx";
 
 <CatalogDetail
+  previewSrc="/public/catalog/blocks/lottie-character-walk.json"
   compositionId="lottie-character-walk"
   compositionSrc="compositions/lottie-character-walk/lottie-character-walk.html"
   title="Lottie Character Walk"
   description="A jointed flat character walks in on planted feet, stops and points at a card; the body acting is a Lottie file and the stage is GSAP."
-  variables={[]}
+  variables={[{"id":"title","type":"string","label":"Card title","default":"Meet your guide","maxLength":28},{"id":"body","type":"string","label":"Card text","default":"Walks in on planted feet, then points the way.","maxLength":90}]}
   meta={{"duration":7.5,"width":1920,"height":1080,"category":"Blocks","badge":"Stable","codeLines":137}}
   attribution={{"path":"registry/blocks/lottie-character-walk","tags":["character","character-animation","mascot","walk-cycle","gesture","pointing","puppet","lottie","explainer"]}}
-  video="https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/lottie-character-walk.mp4"
-  poster="https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/lottie-character-walk.png"
   hasCode
   rawUrl="https://raw.githubusercontent.com/heygen-com/hyperframes/main/registry/blocks/lottie-character-walk/lottie-character-walk.html"
 >
