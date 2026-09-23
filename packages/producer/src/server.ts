@@ -22,7 +22,7 @@ import {
   rmSync,
   createReadStream,
 } from "node:fs";
-import { resolve, dirname, join } from "node:path";
+import { resolve, dirname, join, relative, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import { parseArgs } from "node:util";
 import crypto from "node:crypto";
@@ -328,12 +328,44 @@ function resolvePreparedRenderOutput(
   prepared: PreparedRenderInput,
   rendersDir: string,
   log: ProducerLogger,
-): { input: RenderInput; cleanupProjectDir?: string; absoluteOutputPath: string } {
+):
+  | { input: RenderInput; cleanupProjectDir?: string; absoluteOutputPath: string }
+  | { error: string } {
+  const outputError = validateRenderOutputPath(prepared.input.outputPath, rendersDir);
+  if (outputError) return { error: outputError };
   const { input, cleanupProjectDir } = prepared;
   const absoluteOutputPath = resolveOutputPath(input.projectDir, input.outputPath, rendersDir, log);
   const outputDir = dirname(absoluteOutputPath);
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
   return { input, cleanupProjectDir, absoluteOutputPath };
+}
+
+/**
+ * The render handlers accept an unauthenticated caller-supplied destination
+ * path, and the server's output-artifact route hands the rendered file back.
+ * Without containment that pair lets any caller who can reach the bound
+ * interface write attacker-directed files anywhere the server process can.
+ * Renders belong in the producer renders directory: a bare filename joins
+ * it, anything else must resolve inside it. The legacy `output` alias shares
+ * this check via the same candidate.
+ */
+export function validateRenderOutputPath(
+  outputCandidate: string | null | undefined,
+  rendersDir: string,
+): string | undefined {
+  if (!outputCandidate) return undefined;
+  if (
+    !outputCandidate.includes("/") &&
+    !outputCandidate.includes("\\") &&
+    !isAbsolute(outputCandidate)
+  ) {
+    return undefined;
+  }
+  const absoluteOutputPath = resolve(outputCandidate);
+  const absoluteRendersDir = resolve(rendersDir);
+  const rel = relative(absoluteRendersDir, absoluteOutputPath);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) return undefined;
+  return `outputPath must be within the producer renders directory (${absoluteRendersDir}); received: ${outputCandidate}`;
 }
 
 /**
@@ -408,6 +440,37 @@ function prepareProjectDirectory(
   return { prepared: { input: { projectDir: absProjectDir, ...options } } };
 }
 
+/** Hostnames that resolve to the loopback interface, compared lowercased. */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1"]);
+
+/**
+ * The server fetches the previewUrl on behalf of the requester and returns the
+ * fetched document inside the rendered output, so an unvalidated URL is a
+ * read-SSRF primitive against whatever the server can reach. The legitimate
+ * source is the co-located preview server, so validation is loopback-only by
+ * default; `PRODUCER_PREVIEW_HOST_ALLOWLIST` (comma-separated hostnames)
+ * extends it for deployments that render other explicitly trusted hosts.
+ */
+export function validatePreviewUrl(raw: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return "previewUrl is not a valid URL";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `previewUrl must use http or https, received: ${parsed.protocol}`;
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (LOOPBACK_HOSTNAMES.has(hostname)) return undefined;
+  const allowlist = (process.env.PRODUCER_PREVIEW_HOST_ALLOWLIST ?? "")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowlist.includes(hostname)) return undefined;
+  return `previewUrl must target the loopback interface (localhost, 127.0.0.1, ::1) or a PRODUCER_PREVIEW_HOST_ALLOWLIST host; received: ${hostname}`;
+}
+
 async function resolveInlineRenderHtml(body: Record<string, unknown>): Promise<
   | { html: string }
   | {
@@ -419,6 +482,8 @@ async function resolveInlineRenderHtml(body: Record<string, unknown>): Promise<
   const previewUrl = nonEmptyString(body.previewUrl);
   if (!previewUrl)
     return { error: "Missing render source: provide projectDir, previewUrl, or html" };
+  const previewUrlError = validatePreviewUrl(previewUrl);
+  if (previewUrlError) return { error: previewUrlError };
   try {
     const response = await fetch(previewUrl, { method: "GET" });
     if (!response.ok) {
@@ -729,11 +794,11 @@ export function createRenderHandlers(options: HandlerOptions = {}): RenderHandle
       return c.json({ success: false, requestId, error: preparedResult.error }, 400);
     }
 
-    const { input, cleanupProjectDir, absoluteOutputPath } = resolvePreparedRenderOutput(
-      preparedResult.prepared,
-      rendersDir,
-      log,
-    );
+    const resolvedOutput = resolvePreparedRenderOutput(preparedResult.prepared, rendersDir, log);
+    if ("error" in resolvedOutput) {
+      return c.json({ success: false, requestId, error: resolvedOutput.error }, 400);
+    }
+    const { input, cleanupProjectDir, absoluteOutputPath } = resolvedOutput;
 
     const release = await renderSemaphore.acquire();
 
@@ -817,11 +882,19 @@ export function createRenderHandlers(options: HandlerOptions = {}): RenderHandle
       const prepared = await prepareSseRenderRequest(c, stream, requestId);
       if (!prepared) return;
 
-      const { input, cleanupProjectDir, absoluteOutputPath } = resolvePreparedRenderOutput(
-        prepared,
-        rendersDir,
-        log,
-      );
+      const resolvedOutput = resolvePreparedRenderOutput(prepared, rendersDir, log);
+      if ("error" in resolvedOutput) {
+        await stream.writeSSE({
+          data: JSON.stringify({
+            type: "error",
+            requestId,
+            error: resolvedOutput.error,
+            stage: "validation",
+          }),
+        });
+        return;
+      }
+      const { input, cleanupProjectDir, absoluteOutputPath } = resolvedOutput;
 
       log.info("render-stream started", { requestId, projectDir: input.projectDir });
 
