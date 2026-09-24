@@ -1,8 +1,9 @@
 import { Hono } from "hono";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createServer as createHttpServer } from "node:http";
 
 const capturedRenderConfigs = vi.hoisted(() => new Array<Record<string, unknown>>());
 const capturedExecuteOutputPaths = vi.hoisted(() => new Array<string>());
@@ -52,20 +53,25 @@ afterEach(() => {
   rmSync(sandbox, { recursive: true, force: true });
 });
 
-function createApp(): Hono {
+interface HandlerAppOptions {
+  allowedOutputRoots?: string[];
+}
+
+function createApp(handlerOptions: HandlerAppOptions = {}): Hono {
   const app = new Hono();
   const handlers = createRenderHandlers({
     getRequestId: () => "guard-test",
     maxConcurrentRenders: 1,
     rendersDir,
+    ...handlerOptions,
   });
   app.post("/render", handlers.render);
   app.post("/render/stream", handlers.renderStream);
   return app;
 }
 
-function requestStream(overrides: Record<string, unknown>) {
-  return createApp().request("/render/stream", {
+function requestStream(overrides: Record<string, unknown>, app = createApp()) {
+  return app.request("/render/stream", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ html: "<html><body></body></html>", ...overrides }),
@@ -73,9 +79,9 @@ function requestStream(overrides: Record<string, unknown>) {
 }
 
 describe("POST /render — outputPath containment", () => {
-  it("rejects an outputPath that escapes the renders directory", async () => {
+  it("rejects an outputPath that escapes the renders directory when output roots are declared", async () => {
     const escaped = join(sandbox, "outside", "evil.mp4");
-    const response = await createApp().request("/render", {
+    const response = await createApp({ allowedOutputRoots: [rendersDir] }).request("/render", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ html: "<html><body></body></html>", outputPath: escaped }),
@@ -88,9 +94,10 @@ describe("POST /render — outputPath containment", () => {
   });
 
   it("rejects a traversal outputPath that resolves outside the renders directory", async () => {
-    const response = await requestStream({
-      outputPath: join(rendersDir, "..", "outside", "evil.mp4"),
-    });
+    const response = await requestStream(
+      { outputPath: join(rendersDir, "..", "outside", "evil.mp4") },
+      createApp({ allowedOutputRoots: [rendersDir] }),
+    );
 
     expect(response.status).toBe(200); // SSE envelope
     const text = await response.text();
@@ -101,7 +108,7 @@ describe("POST /render — outputPath containment", () => {
   });
 
   it("rejects the legacy `output` alias with the same containment", async () => {
-    const response = await createApp().request("/render", {
+    const response = await createApp({ allowedOutputRoots: [rendersDir] }).request("/render", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ html: "<html><body></body></html>", output: "C:\\evil\\x.mp4" }),
@@ -110,6 +117,66 @@ describe("POST /render — outputPath containment", () => {
     expect(response.status).toBe(400);
     expect(await response.text()).toContain("renders directory");
     expect(capturedRenderConfigs).toHaveLength(0);
+  });
+
+  it("does not echo the server's absolute renders directory back to the caller", async () => {
+    const response = await createApp({ allowedOutputRoots: [rendersDir] }).request("/render", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        html: "<html><body></body></html>",
+        outputPath: join(sandbox, "outside", "evil.mp4"),
+      }),
+    });
+
+    const text = await response.text();
+    expect(response.status).toBe(400);
+    expect(text).not.toContain(rendersDir);
+    expect(text).not.toContain(sandbox);
+  });
+
+  it("rejects an outputPath written through a symlinked subdirectory of the renders directory", async () => {
+    mkdirSync(rendersDir, { recursive: true });
+    const outside = join(sandbox, "symlink-target");
+    mkdirSync(outside, { recursive: true });
+    let linked = false;
+    try {
+      symlinkSync(outside, join(rendersDir, "link"), "dir");
+      linked = true;
+    } catch {
+      // Windows without symlink privilege: the realpath guard is still
+      // exercised by the implementation; pin it only where symlinks work.
+    }
+    if (!linked) return;
+
+    const response = await requestStream(
+      { outputPath: join(rendersDir, "link", "evil.mp4") },
+      createApp({ allowedOutputRoots: [rendersDir] }),
+    );
+
+    const text = await response.text();
+    expect(text).toContain('"type":"error"');
+    expect(capturedRenderConfigs).toHaveLength(0);
+    expect(existsSync(join(outside, "evil.mp4"))).toBe(false);
+  });
+
+  it("accepts an embedder that declares its own output roots", async () => {
+    const jobRoot = join(sandbox, "per-job");
+    const response = await requestStream(
+      { outputPath: join(jobRoot, "out.mp4") },
+      createApp({ allowedOutputRoots: [jobRoot] }),
+    );
+
+    expect(await response.text()).toContain('"type":"complete"');
+    expect(capturedExecuteOutputPaths[0]).toBe(join(jobRoot, "out.mp4"));
+  });
+
+  it("keeps absolute output paths working for handlers built without declared roots", async () => {
+    const absolute = join(sandbox, "embedder-choice", "out.mp4");
+    const response = await requestStream({ outputPath: absolute }, createApp());
+
+    expect(await response.text()).toContain('"type":"complete"');
+    expect(capturedExecuteOutputPaths[0]).toBe(absolute);
   });
 
   it("accepts a bare filename and renders inside the renders directory", async () => {
@@ -123,7 +190,10 @@ describe("POST /render — outputPath containment", () => {
   });
 
   it("accepts an outputPath nested inside the renders directory", async () => {
-    const response = await requestStream({ outputPath: join(rendersDir, "sub", "out.mp4") });
+    const response = await requestStream(
+      { outputPath: join(rendersDir, "sub", "out.mp4") },
+      createApp({ allowedOutputRoots: [rendersDir] }),
+    );
 
     expect(await response.text()).toContain('"type":"complete"');
     expect(capturedRenderConfigs).toHaveLength(1);
@@ -158,6 +228,7 @@ describe("previewUrl guard", () => {
     expect(validatePreviewUrl("http://192.168.1.5:8080/")).toContain("loopback");
     expect(validatePreviewUrl("https://example.com/")).toContain("loopback");
     expect(validatePreviewUrl("http://169.254.169.254/latest/meta-data")).toContain("loopback");
+    expect(validatePreviewUrl("http://127.0.0.2:4173/")).toContain("loopback");
   });
 
   it("honors the PRODUCER_PREVIEW_HOST_ALLOWLIST override", () => {
@@ -181,17 +252,60 @@ describe("previewUrl guard", () => {
     expect(capturedRenderConfigs).toHaveLength(0);
   });
 
-  it("lets a loopback previewUrl pass validation and reach the fetch stage", async () => {
-    const response = await createApp().request("/render/stream", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ previewUrl: "http://127.0.0.1:1/index.html" }),
+  it("does not follow a redirect that leaves the loopback policy", async () => {
+    // A second loopback address (127.0.0.2 is inside 127/8) plays the role of
+    // an internal host the first URL redirects to.
+    const secret = createHttpServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<html><body>TOPSECRET-PAGE</body></html>");
     });
+    await new Promise<void>((resolvePromise) => secret.listen(0, "127.0.0.2", resolvePromise));
+    const secretPort = (secret.address() as { port: number }).port;
 
-    const text = await response.text();
-    // Guard passed (no "loopback" complaint); the fetch itself fails fast on a
-    // refused loopback port, proving the request proceeded past validation.
-    expect(text).not.toContain("loopback");
-    expect(text).toContain("Failed to fetch previewUrl");
+    const redirector = createHttpServer((_req, res) => {
+      res.writeHead(302, { location: `http://127.0.0.2:${secretPort}/` });
+      res.end();
+    });
+    await new Promise<void>((resolvePromise) => redirector.listen(0, "127.0.0.1", resolvePromise));
+    const redirectPort = (redirector.address() as { port: number }).port;
+
+    try {
+      const response = await createApp().request("/render/stream", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ previewUrl: `http://127.0.0.1:${redirectPort}/` }),
+      });
+
+      const text = await response.text();
+      expect(text).toContain('"type":"error"');
+      expect(text).toContain("loopback");
+      expect(text).not.toContain("TOPSECRET-PAGE");
+      expect(capturedRenderConfigs).toHaveLength(0);
+    } finally {
+      secret.close();
+      redirector.close();
+    }
+  });
+
+  it("still fetches a loopback previewUrl that does not redirect", async () => {
+    const target = createHttpServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<html><body>loopback page</body></html>");
+    });
+    await new Promise<void>((resolvePromise) => target.listen(0, "127.0.0.1", resolvePromise));
+    const port = (target.address() as { port: number }).port;
+
+    try {
+      const response = await createApp().request("/render/stream", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ previewUrl: `http://127.0.0.1:${port}/index.html` }),
+      });
+
+      expect(await response.text()).toContain('"type":"complete"');
+      expect(capturedRenderConfigs).toHaveLength(1);
+    } finally {
+      target.close();
+    }
   });
 });
